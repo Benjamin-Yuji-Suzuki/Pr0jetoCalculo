@@ -121,7 +121,3 @@ Projeto desenvolvido para a disciplina de **Resolução Diferencial de Problemas
 - Alberto Costa ✍️  
 
 > *"A otimização não é apenas sobre cortar custos, é sobre encontrar o equilíbrio perfeito."* ⚖️
-
-✅ Agora sim: **Markdown puro, sem caixa de código gigante**, pronto pra colar direto no GitHub.  
-
-Quer que eu adicione **badges no topo** (versão do Python, licença, status do projeto) pra dar aquele visual profissional?
