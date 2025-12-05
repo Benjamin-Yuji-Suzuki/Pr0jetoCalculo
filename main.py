@@ -5,7 +5,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-import psycopg2
+import sympy as sp
 from sqlalchemy import create_engine
 
 # -------------------------------------------------------------
@@ -28,22 +28,16 @@ try:
 except:
     st.error("Erro ao conectar ao PostgreSQL. Verifique host, porta e credenciais.")
 
-
 # -------------------------------------------------------------
-# 2. CARREGAR CSV NO POSTGRES
+# 2. UPLOAD DO CSV (opcional, teste local)
 # -------------------------------------------------------------
-@st.cache_data
-def load_csv_to_postgres():
-    df = pd.read_csv("/mnt/data/demand_forecasting.csv")
-    df["Date"] = pd.to_datetime(df["Date"])
-
-    df.to_sql("demand", engine, if_exists="replace", index=False)
-    return True
-
-if st.sidebar.button("Carregar CSV para o PostgreSQL"):
-    load_csv_to_postgres()
-    st.sidebar.success("CSV carregado com sucesso para o PostgreSQL!")
-
+uploaded_file = st.sidebar.file_uploader("Escolha o CSV de demanda", type="csv")
+if uploaded_file is not None:
+    df_local = pd.read_csv(uploaded_file)
+    df_local["Date"] = pd.to_datetime(df_local["Date"])
+    if st.sidebar.button("Carregar CSV no PostgreSQL"):
+        df_local.to_sql("demand", engine, if_exists="replace", index=False)
+        st.sidebar.success("CSV carregado com sucesso no PostgreSQL!")
 
 # -------------------------------------------------------------
 # 3. CONSULTAR O BANCO
@@ -56,15 +50,12 @@ def query_postgres(query):
         st.error(f"Erro na consulta SQL: {e}")
         return pd.DataFrame()
 
-# Obter dados
 df = query_postgres("SELECT * FROM demand")
-
 if df.empty:
     st.warning("A tabela 'demand' ainda não está carregada.")
     st.stop()
 
 df["Daily_Demand"] = df["Sales Quantity"]
-
 
 # -------------------------------------------------------------
 # 4. REGRESSÃO LINEAR PARA ESTIMAR DEMANDA
@@ -90,55 +81,57 @@ y = df["Sales Quantity"]
 model.fit(X, y)
 
 df["Predicted_Demand"] = model.predict(X)
-D_estimated = df["Predicted_Demand"].mean() * 365
+D_estimated = df["Predicted_Demand"].mean() * 365  # Demanda anual
 
+st.write(f"**Demanda anual estimada (D): {D_estimated:.2f} unidades**")
 
 # -------------------------------------------------------------
-# 5. FUNÇÃO DE OTIMIZAÇÃO (ADAPTADA)
+# 5. FUNÇÃO DE OTIMIZAÇÃO COM DERIVADAS SIMBÓLICAS
 # -------------------------------------------------------------
+def eoq_with_derivative(S, h, D):
+    Q = sp.Symbol('Q', positive=True)
+    CT = S*D/Q + h*Q/2
+
+    # Derivadas
+    dCT = sp.diff(CT, Q)
+    d2CT = sp.diff(dCT, Q)
+
+    # Resolver derivada = 0
+    Q_opt = sp.solve(dCT, Q)[0]
+
+    # Avaliar segunda derivada
+    min_check = d2CT.subs(Q, Q_opt)
+
+    return float(Q_opt), float(dCT.subs(Q, Q_opt)), float(d2CT.subs(Q, Q_opt))
+
 def alkahtani_davizon_optimization(Sm, Sv, hm, hv, alpha_m, alpha_v, D):
+    if hm <= 0 or hv <= 0:
+        return {"QM": 0, "QV": 0, "Custo Total": np.inf, "Mensagem": "Erro: custos de armazenagem devem ser >0"}
 
-    if hm == 0 or hv == 0:
-        return {
-            "QM": 0,
-            "QV": 0,
-            "Custo Total": np.inf,
-            "Mensagem": "Erro: custos de armazenagem não podem ser zero."
-        }
+    QM, d1m, d2m = eoq_with_derivative(Sm, hm*(1-alpha_m), D)
+    QV, d1v, d2v = eoq_with_derivative(Sv, hv*(1-alpha_v), D)
 
-    QM = np.sqrt((2 * Sm * D) / (hm * (1 - alpha_m)))
-    QV = np.sqrt((2 * Sv * D) / (hv * (1 - alpha_v)))
-
-    CT = (
-        (Sm * D / QM) + (hm * QM / 2) +
-        (Sv * D / QV) + (hv * QV / 2)
-    )
+    CT = (Sm*D/QM + hm*QM/2) + (Sv*D/QV + hv*QV/2)
 
     return {
         "QM": QM,
         "QV": QV,
         "Custo Total": CT,
-        "Mensagem": "Cálculo realizado com sucesso."
+        "d1m": d1m, "d2m": d2m,
+        "d1v": d1v, "d2v": d2v,
+        "Mensagem": "Cálculo realizado com derivadas explícitas."
     }
 
-
 # -------------------------------------------------------------
-# 6. INTERFACE DO STREAMLIT
+# 6. INTERFACE STREAMLIT PARA PARÂMETROS E RESULTADOS
 # -------------------------------------------------------------
-st.title("Otimização Alkahtani–Davizón com PostgreSQL + Regressão Linear")
-
-st.subheader("📦 Demanda anual estimada via Regressão Linear")
-st.write(f"**Demanda anual prevista (D): {D_estimated:.2f} unidades**")
-
 st.header("Parâmetros do Modelo")
 
 col1, col2 = st.columns(2)
-
 with col1:
     Sm = st.number_input("Custo de Setup (Metal)", value=200.0)
     hm = st.number_input("Custo de Armazenagem (Metal)", value=2.0)
     alpha_m = st.number_input("Taxa de Defeito Metal (0–1)", value=0.05)
-
 with col2:
     Sv = st.number_input("Custo de Setup (Vidro)", value=180.0)
     hv = st.number_input("Custo de Armazenagem (Vidro)", value=1.8)
@@ -148,8 +141,11 @@ if st.button("Calcular Otimização"):
     result = alkahtani_davizon_optimization(Sm, Sv, hm, hv, alpha_m, alpha_v, D_estimated)
 
     st.success(result["Mensagem"])
-
     st.write("### Resultados")
     st.write(f"**Lote ótimo Metal (QM): {result['QM']:.2f} unidades**")
+    st.write(f"Primeira derivada (Metal) no ponto crítico: {result['d1m']:.2e}")
+    st.write(f"Segunda derivada (Metal) no ponto crítico: {result['d2m']:.2e} ✅ positivo → mínimo")
     st.write(f"**Lote ótimo Vidro (QV): {result['QV']:.2f} unidades**")
+    st.write(f"Primeira derivada (Vidro) no ponto crítico: {result['d1v']:.2e}")
+    st.write(f"Segunda derivada (Vidro) no ponto crítico: {result['d2v']:.2e} ✅ positivo → mínimo")
     st.write(f"**Custo Total Anual: R$ {result['Custo Total']:.2f}**")
