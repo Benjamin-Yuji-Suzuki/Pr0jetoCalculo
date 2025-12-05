@@ -31,15 +31,17 @@ A ferramenta utiliza **Cálculo Diferencial** (via biblioteca `SymPy`) para deri
 
 ---
 
-## 🛠️ Tecnologias Utilizadas
+## 🛠️ Tecnologias e Ferramentas
 
-| Componente   | Tecnologia   | Função |
-|--------------|--------------|--------|
-| **Linguagem** | Python 3.11 | Lógica principal e orquestração |
-| **Matemática** | SymPy | Cálculo diferencial simbólico e resolução de equações |
-| **Frontend** | Streamlit | Interface do usuário e visualização de dados |
-| **Backend/DB** | PostgreSQL | Armazenamento persistente do histórico de decisões |
-| **Análise** | Pandas/NumPy | Manipulação de datasets e estatística descritiva |
+| Componente | Tecnologia(s) | Função no Projeto |
+| :--- | :--- | :--- |
+| **Linguagem** | Python 3.11+ | Orquestração de todo o sistema full stack. |
+| **Matemática** | **SymPy** | Cálculo Diferencial Simbólico: derivadas da função de custo e prova de convexidade. |
+| **Machine Learning** | **Scikit-learn** | Pipelines de regressão linear (`LinearRegression`) e pré-processamento (`OneHotEncoder`) para previsão de demanda. |
+| **Visualização** | **Seaborn & Matplotlib** | Plotagem da curva de custo total (prova visual do mínimo) e gráficos de séries temporais. |
+| **Interface (UI)** | **Streamlit** | Dashboard interativo web, upload de arquivos e visualização de métricas. |
+| **Persistência** | **PostgreSQL + SQLAlchemy** | Banco de dados relacional e ORM para conexão robusta e persistência do histórico. |
+| **Dados** | Pandas & NumPy | Manipulação de DataFrames, limpeza de dados (ETL) e cálculos vetoriais. |
 
 ---
 
