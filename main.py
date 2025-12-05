@@ -9,7 +9,7 @@ import sympy as sp
 from sqlalchemy import create_engine
 
 # -------------------------------------------------------------
-# 1. CONFIGURAÇÃO DO POSTGRES (inputs no Streamlit)
+# 1. CONFIGURAÇÃO DO POSTGRES
 # -------------------------------------------------------------
 st.sidebar.header("Configuração do PostgreSQL")
 
@@ -19,28 +19,32 @@ pg_db   = st.sidebar.text_input("Database", "meubanco")
 pg_user = st.sidebar.text_input("Usuário", "postgres")
 pg_pass = st.sidebar.text_input("Senha", "1234", type="password")
 
-# Criar URL do SQLAlchemy
 pg_url = f"postgresql+psycopg2://{pg_user}:{pg_pass}@{pg_host}:{pg_port}/{pg_db}"
 
-# Criar engine
 try:
     engine = create_engine(pg_url)
-except:
-    st.error("Erro ao conectar ao PostgreSQL. Verifique host, porta e credenciais.")
+except Exception as e:
+    st.error(f"Erro ao conectar ao PostgreSQL: {e}")
 
 # -------------------------------------------------------------
-# 2. UPLOAD DO CSV (opcional, teste local)
+# 2. UPLOAD DO CSV E CARREGAMENTO NO POSTGRES
 # -------------------------------------------------------------
+st.sidebar.header("Upload do CSV de demanda")
 uploaded_file = st.sidebar.file_uploader("Escolha o CSV de demanda", type="csv")
+
 if uploaded_file is not None:
     df_local = pd.read_csv(uploaded_file)
     df_local["Date"] = pd.to_datetime(df_local["Date"])
+
     if st.sidebar.button("Carregar CSV no PostgreSQL"):
-        df_local.to_sql("demand", engine, if_exists="replace", index=False)
-        st.sidebar.success("CSV carregado com sucesso no PostgreSQL!")
+        try:
+            df_local.to_sql("demand", engine, if_exists="replace", index=False)
+            st.sidebar.success("CSV carregado com sucesso no PostgreSQL!")
+        except Exception as e:
+            st.sidebar.error(f"Erro ao carregar CSV no PostgreSQL: {e}")
 
 # -------------------------------------------------------------
-# 3. CONSULTAR O BANCO
+# 3. CONSULTA DOS DADOS NO POSTGRES
 # -------------------------------------------------------------
 def query_postgres(query):
     try:
@@ -58,7 +62,7 @@ if df.empty:
 df["Daily_Demand"] = df["Sales Quantity"]
 
 # -------------------------------------------------------------
-# 4. REGRESSÃO LINEAR PARA ESTIMAR DEMANDA
+# 4. REGRESSÃO LINEAR PARA ESTIMAR DEMANDA ANUAL
 # -------------------------------------------------------------
 categorical_cols = ["Store ID", "Promotions", "Seasonality Factors",
                     "External Factors", "Customer Segments"]
@@ -81,7 +85,7 @@ y = df["Sales Quantity"]
 model.fit(X, y)
 
 df["Predicted_Demand"] = model.predict(X)
-D_estimated = df["Predicted_Demand"].mean() * 365  # Demanda anual
+D_estimated = df["Predicted_Demand"].mean() * 365
 
 st.write(f"**Demanda anual estimada (D): {D_estimated:.2f} unidades**")
 
@@ -92,15 +96,9 @@ def eoq_with_derivative(S, h, D):
     Q = sp.Symbol('Q', positive=True)
     CT = S*D/Q + h*Q/2
 
-    # Derivadas
     dCT = sp.diff(CT, Q)
     d2CT = sp.diff(dCT, Q)
-
-    # Resolver derivada = 0
     Q_opt = sp.solve(dCT, Q)[0]
-
-    # Avaliar segunda derivada
-    min_check = d2CT.subs(Q, Q_opt)
 
     return float(Q_opt), float(dCT.subs(Q, Q_opt)), float(d2CT.subs(Q, Q_opt))
 
