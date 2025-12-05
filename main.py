@@ -1,289 +1,257 @@
 import streamlit as st
 import pandas as pd
-import sympy as sp
 import numpy as np
-import psycopg2 # Conector do PostgreSQL
-from psycopg2 import sql
-from datetime import datetime
-import warnings
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+import sympy as sp
+from sqlalchemy import create_engine
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-# --- Configuração Inicial da Página ---
-st.set_page_config(
-    page_title="Sistema de Otimização Alkahtani-Davizón",
-    layout="wide",
-    page_icon="🛡️"
-)
+# Configuração da página para usar largura total (melhora os gráficos)
+st.set_page_config(layout="wide", page_title="Otimização Alkahtani-Davizón")
 
-# --- CONFIGURAÇÃO DO BANCO DE DADOS (POSTGRESQL) ---
-# Edite aqui com as suas credenciais do pgAdmin 4
-DB_CONFIG = {
-    "dbname": "estoque_opt",
-    "user": "postgres",      # Usuário padrão costuma ser 'postgres'
-    "password": "1234",     # <--- COLOQUE SUA SENHA DO PGADMIN AQUI
-    "host": "localhost",
-    "port": "5432"
-}
+# -------------------------------------------------------------
+# 1. CONFIGURAÇÃO DO POSTGRES
+# -------------------------------------------------------------
+st.sidebar.header("Configuração do PostgreSQL")
 
-# --- Camada de Persistência (PostgreSQL) ---
-def get_db_connection():
-    """Cria e retorna uma conexão com o banco PostgreSQL."""
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        return conn
-    except Exception as e:
-        st.error(f"Erro ao conectar no PostgreSQL: {e}")
-        return None
+pg_host = st.sidebar.text_input("Host", "localhost")
+pg_port = st.sidebar.text_input("Porta", "5432")
+pg_db   = st.sidebar.text_input("Database", "meubanco")
+pg_user = st.sidebar.text_input("Usuário", "postgres")
+pg_pass = st.sidebar.text_input("Senha", "1234", type="password")
 
-def init_db():
-    """Inicializa a tabela no PostgreSQL se não existir."""
-    conn = get_db_connection()
-    if conn:
-        cur = conn.cursor()
-        # Nota: Em Postgres usa-se SERIAL para auto-incremento
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS simulacoes (
-                id SERIAL PRIMARY KEY,
-                data_hora TIMESTAMP,
-                demanda_anual REAL,
-                lote_otimo REAL,
-                custo_minimo REAL,
-                setup_total REAL,
-                holding_medio REAL
-            );
-        ''')
-        conn.commit()
-        cur.close()
-        conn.close()
+pg_url = f"postgresql+psycopg2://{pg_user}:{pg_pass}@{pg_host}:{pg_port}/{pg_db}"
 
-def salvar_simulacao(D, Q_star, Min_Cost, S_m, S_v, h_m, h_v):
-    """Salva os resultados da simulação no banco."""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cur = conn.cursor()
-            data_hora = datetime.now()
-            
-            # --- CORREÇÃO DO ERRO (NumPy -> Python Float) ---
-            # O PostgreSQL não aceita tipos numpy (np.float64).
-            # Convertemos explicitamente para float nativo do Python.
-            val_D = float(D)
-            val_Q = float(Q_star)
-            val_Min = float(Min_Cost)
-            val_Setup = float(S_m + S_v)
-            val_Holding = float((h_m + h_v) / 2)
-            
-            cur.execute('''
-                INSERT INTO simulacoes (data_hora, demanda_anual, lote_otimo, custo_minimo, setup_total, holding_medio)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            ''', (data_hora, val_D, val_Q, val_Min, val_Setup, val_Holding))
-            
-            conn.commit()
-            cur.close()
-        except Exception as e:
-            st.error(f"Erro ao salvar no banco: {e}")
-        finally:
-            conn.close()
-
-def carregar_historico():
-    """Carrega o histórico de simulações."""
-    conn = get_db_connection()
-    df = pd.DataFrame()
-    if conn:
-        try:
-            # Suprime o aviso de que pandas prefere SQLAlchemy
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                df = pd.read_sql_query("SELECT * FROM simulacoes ORDER BY id DESC", conn)
-        except Exception as e:
-            st.error(f"Erro ao ler histórico: {e}")
-        finally:
-            conn.close()
-    return df
-
-# Inicializa a tabela na primeira execução
-# (Colocamos num try/except para não quebrar o app se o banco não estiver rodando)
 try:
-    init_db()
+    engine = create_engine(pg_url)
 except Exception as e:
-    st.error(f"⚠️ Aviso: Não foi possível inicializar o banco de dados. Verifique se o PostgreSQL está rodando e se o banco 'estoque_opt' foi criado. Erro: {e}")
+    st.error(f"Erro ao conectar ao PostgreSQL: {e}")
 
-# --- Função de Otimização (Lógica Matemática com SymPy) ---
-def alkahtani_optimization(D, S_m, S_v, h_m, h_v, alpha_m, alpha_v):
-    """
-    Calcula o Q* (Lote Econômico) usando SymPy para derivar a função de custo total.
-    Retorna também a fórmula simbólica para exibição.
-    """
-    # Definindo a variável simbólica
-    Q = sp.symbols('Q', real=True, positive=True)
-    
-    # Parâmetros simbólicos para exibição didática
-    D_sym, Sm_sym, Sv_sym, hm_sym, hv_sym = sp.symbols('D S_m S_v h_m h_v')
-    
-    # Prevenção de erro de divisão por zero
-    if Q == 0:
-        return 0, 0, False, ""
+# -------------------------------------------------------------
+# 2. UPLOAD DO CSV E CARREGAMENTO NO POSTGRES
+# -------------------------------------------------------------
+st.sidebar.header("Upload do CSV de demanda")
+uploaded_file = st.sidebar.file_uploader("Escolha o CSV de demanda", type="csv")
 
-    # Custos de Manutenção (Holding Cost) ajustados por defeitos
-    H_total = (Q / 2) * (h_m * (1 + alpha_m) + h_v * (1 + alpha_v))
+if uploaded_file is not None:
+    df_local = pd.read_csv(uploaded_file)
+    # Tenta converter data, se falhar tenta inferir
+    if "Date" in df_local.columns:
+        df_local["Date"] = pd.to_datetime(df_local["Date"])
     
-    # Custos de Setup (Fabricante + Fornecedor)
-    S_total = (S_m + S_v) * D / Q
-    
-    # Custo Total (Função Objetivo)
-    TC = S_total + H_total
-    
-    # 1. Primeira Derivada (dTC/dQ)
-    dTC = sp.diff(TC, Q)
-    
-    # 2. Segunda Derivada (para provar convexidade)
-    d2TC = sp.diff(TC, Q, 2)
-    
-    # 3. Resolução da equação dTC/dQ = 0
-    sol = sp.solve(dTC, Q)
-    
-    if not sol:
-        return 0, 0, False, ""
-        
-    q_opt = float(sol[0]) # Pega a primeira raiz positiva
-    
-    # Calcula valor do custo mínimo e verifica convexidade
-    min_cost = float(TC.subs(Q, q_opt))
-    is_convex = d2TC.subs(Q, q_opt) > 0
-    
-    # Gera a fórmula LaTeX da derivada para explicação
-    latex_derivative = sp.latex(dTC)
-    
-    return q_opt, min_cost, is_convex, latex_derivative
+    if st.sidebar.button("Carregar CSV no PostgreSQL"):
+        try:
+            df_local.to_sql("demand", engine, if_exists="replace", index=False)
+            st.sidebar.success("CSV carregado com sucesso no PostgreSQL!")
+        except Exception as e:
+            st.sidebar.error(f"Erro ao carregar CSV no PostgreSQL: {e}")
 
-# --- Interface do Usuário ---
+# -------------------------------------------------------------
+# 3. CONSULTA DOS DADOS NO POSTGRES
+# -------------------------------------------------------------
+def query_postgres(query):
+    try:
+        df = pd.read_sql_query(query, engine)
+        return df
+    except Exception as e:
+        st.error(f"Erro na consulta SQL: {e}")
+        return pd.DataFrame()
 
-st.title("🛡️ Sistema de Apoio à Decisão: Otimização Logística")
-st.caption("Projeto Bimestral - Resolução Diferencial de Problemas")
+df = query_postgres("SELECT * FROM demand")
 
-# Abas para organizar o sistema conforme rubrica (Simulação vs Histórico)
-tab1, tab2, tab3 = st.tabs(["📊 Painel de Otimização", "📚 Justificativa Matemática", "🗄️ Histórico de Decisões"])
+# Se o banco estiver vazio, interrompe aqui para não dar erro
+if df.empty:
+    st.warning("⚠️ A tabela 'demand' ainda não está carregada no banco. Faça o upload do CSV na barra lateral.")
+    st.stop()
 
-with tab1:
-    st.markdown("### Parâmetros da Operação")
+# Garantir que temos as colunas certas
+if "Sales Quantity" in df.columns:
+    df["Daily_Demand"] = df["Sales Quantity"]
+else:
+    st.error("O CSV precisa ter uma coluna 'Sales Quantity'.")
+    st.stop()
+
+# -------------------------------------------------------------
+# 4. REGRESSÃO LINEAR (PREVISÃO)
+# -------------------------------------------------------------
+st.title("📊 Sistema de Otimização Alkahtani–Davizón")
+st.markdown("---")
+
+# Prepara colunas para o modelo (adapte conforme seu CSV real)
+# Aqui assumimos que essas colunas existem. Se não existirem, criamos dummies ou avisamos.
+cols_needed = ["Store ID", "Promotions", "Seasonality Factors", "External Factors", "Customer Segments", "Price"]
+available_cols = [c for c in cols_needed if c in df.columns]
+
+if not available_cols:
+    st.warning("Colunas para Machine Learning não encontradas. Usando média simples.")
+    df["Predicted_Demand"] = df["Sales Quantity"].mean()
+else:
+    # Separa categóricas e numéricas das disponíveis
+    cat_cols = [c for c in available_cols if df[c].dtype == 'object']
+    num_cols = [c for c in available_cols if df[c].dtype != 'object']
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+            ("num", "passthrough", num_cols)
+        ]
+    )
+
+    model = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("regressor", LinearRegression())
+    ])
+
+    X = df[available_cols]
+    y = df["Sales Quantity"]
     
-    col_config, col_main = st.columns([1, 2])
+    try:
+        model.fit(X, y)
+        df["Predicted_Demand"] = model.predict(X)
+    except Exception as e:
+        st.warning(f"Erro ao treinar modelo: {e}. Usando média.")
+        df["Predicted_Demand"] = y.mean()
 
-    with col_config:
-        st.subheader("Custos & Restrições")
-        S_m = st.number_input("Custo Setup Fabricante ($)", value=500.0, step=50.0, help="Custo fixo por lote produzido")
-        S_v = st.number_input("Custo Setup Fornecedor ($)", value=200.0, step=50.0, help="Custo fixo de pedido")
-        h_m = st.number_input("Holding Cost Fabricante ($/unid)", value=2.0, step=0.1)
-        h_v = st.number_input("Holding Cost Fornecedor ($/unid)", value=1.5, step=0.1)
-        
-        st.write("---")
-        alpha_m = st.slider("Taxa de Defeito Interna (%)", 0.0, 10.0, 2.0) / 100
-        alpha_v = st.slider("Taxa de Defeito Fornecedor (%)", 0.0, 10.0, 5.0) / 100
+D_estimated = df["Predicted_Demand"].mean() * 365
 
-    with col_main:
-        st.subheader("Demanda (Input)")
-        
-        # Opção para usar dados de exemplo se o usuário não tiver CSV
-        use_sample = st.checkbox("Usar dados simulados (Demo)", value=True)
-        
-        df = None
-        D_annual = 0
-        sigma_demand = 0
-        
-        if use_sample:
-            dates = pd.date_range(start='2023-01-01', periods=365)
-            values = np.random.normal(loc=100, scale=15, size=365)
-            values = [max(0, x) for x in values]
-            df = pd.DataFrame({'Data': dates, 'Demanda': values})
-            
-            # Gráfico pequeno para não poluir
-            st.area_chart(df.set_index('Data'), height=150)
-            
-            daily_avg = df['Demanda'].mean()
-            D_annual = daily_avg * 365
-            sigma_demand = df['Demanda'].std()
-            
-        else:
-            uploaded_file = st.file_uploader("Carregar CSV Real", type="csv")
-            if uploaded_file:
-                try:
-                    df = pd.read_csv(uploaded_file)
-                    if 'Demanda' in df.columns:
-                        daily_avg = df['Demanda'].mean()
-                        D_annual = daily_avg * 365
-                        sigma_demand = df['Demanda'].std()
-                    else:
-                        st.error("CSV deve ter coluna 'Demanda'")
-                except Exception as e:
-                    st.error(f"Erro: {e}")
+# -------------------------------------------------------------
+# 5. VISUALIZAÇÃO 1: SÉRIE TEMPORAL (Novo!)
+# -------------------------------------------------------------
+st.subheader("1. Análise de Demanda (Real vs Machine Learning)")
+col_kpi1, col_kpi2 = st.columns(2)
+col_kpi1.metric("Demanda Diária Média", f"{df['Sales Quantity'].mean():.2f} un")
+col_kpi2.metric("Demanda Anual Projetada (D)", f"{D_estimated:,.2f} un")
 
-        if D_annual > 0:
-            c1, c2 = st.columns(2)
-            c1.metric("Demanda Anual Estimada", f"{int(D_annual):,}")
-            c2.metric("Volatilidade (Risco)", f"{sigma_demand:.2f}")
+# Gráfico com Seaborn/Matplotlib
+if "Date" in df.columns:
+    df["Date"] = pd.to_datetime(df["Date"])
+    fig1, ax1 = plt.subplots(figsize=(12, 4))
+    sns.lineplot(data=df, x='Date', y='Sales Quantity', label='Vendas Reais', alpha=0.5, ax=ax1)
+    sns.lineplot(data=df, x='Date', y='Predicted_Demand', label='Tendência (Regressão)', color='red', linestyle='--', ax=ax1)
+    ax1.set_title("Histórico de Vendas e Tendência")
+    ax1.set_ylabel("Quantidade")
+    ax1.grid(True, linestyle=':', alpha=0.6)
+    st.pyplot(fig1)
+else:
+    st.info("A coluna 'Date' não foi encontrada para plotar o gráfico temporal.")
 
-            st.write("---")
-            if st.button("🚀 Calcular Solução Ótima", type="primary"):
-                
-                with st.spinner("O SymPy está derivando a função de custo..."):
-                    q_star, min_cost, convex, diff_eq = alkahtani_optimization(
-                        D_annual, S_m, S_v, h_m, h_v, alpha_m, alpha_v
-                    )
-                
-                # Salvar no Banco de Dados (Persistência)
-                salvar_simulacao(D_annual, q_star, min_cost, S_m, S_v, h_m, h_v)
-                st.toast("Simulação salva no histórico PostgreSQL!", icon="🐘")
-                
-                # Exibição dos Resultados
-                st.success("##### Recomendação do Sistema")
-                col_res1, col_res2, col_res3 = st.columns(3)
-                col_res1.metric("Lote Econômico (Q*)", f"{int(q_star)} un.")
-                col_res2.metric("Custo Total Mínimo", f"${min_cost:,.2f}")
-                col_res3.metric("Status da Solução", "Ótima Global" if convex else "Inconclusiva")
-                
-                st.info(f"""
-                **Interpretação:** Para minimizar os custos totais da cadeia, o pedido de produção deve ser de aproximadamente **{int(q_star)} unidades**. 
-                Valores menores aumentam excessivamente os custos de setup, e valores maiores aumentam os custos de estoque e risco de defeitos.
-                """)
-                
-                # Guardar a equação para a aba de explicação
-                st.session_state['last_diff_eq'] = diff_eq
+st.markdown("---")
 
-with tab2:
-    st.header("Como a solução foi escolhida?")
-    st.markdown("""
-    O modelo utiliza o cálculo diferencial para encontrar o ponto exato onde a curva de custo total muda de direção (ponto de mínimo).
+# -------------------------------------------------------------
+# 6. FUNÇÃO DE OTIMIZAÇÃO (CÁLCULO)
+# -------------------------------------------------------------
+def eoq_with_derivative(S, h, D):
+    Q = sp.Symbol('Q', positive=True)
+    # Função Objetivo: Custo Total = Setup + Holding
+    CT = S*D/Q + h*Q/2
+
+    dCT = sp.diff(CT, Q)
+    d2CT = sp.diff(dCT, Q)
     
-    **1. Função Objetivo (Custo Total):**
-    $$ TC(Q) = \\frac{D}{Q}(S_m + S_v) + \\frac{Q}{2}[h_m(1 + \\alpha_m) + h_v(1 + \\alpha_v)] $$
-    
-    **2. Derivada Primeira (Custo Marginal):**
-    Para encontrar o mínimo, igualamos a derivada a zero:
-    """)
-    
-    if 'last_diff_eq' in st.session_state:
-        st.latex(f"\\frac{{dTC}}{{dQ}} = {st.session_state['last_diff_eq']} = 0")
+    # Resolve dCT/dQ = 0
+    sol = sp.solve(dCT, Q)
+    if sol:
+        Q_opt = float(sol[0])
+        return Q_opt, float(dCT.subs(Q, Q_opt)), float(d2CT.subs(Q, Q_opt)), CT
     else:
-        st.info("Rode uma simulação para ver a derivada calculada pelo SymPy.")
-        
-    st.markdown("""
-    **3. Validação:**
-    O sistema verifica automaticamente a **segunda derivada**. Se $TC''(Q) > 0$, confirmamos que a solução é um mínimo global (convexidade).
-    """)
+        return 0.0, 0.0, 0.0, CT
 
-with tab3:
-    st.header("🗄️ Histórico de Simulações (PostgreSQL)")
-    st.markdown("Registro persistente vindo do banco de dados `estoque_opt`.")
+def alkahtani_davizon_optimization(Sm, Sv, hm, hv, alpha_m, alpha_v, D):
+    if hm <= 0 or hv <= 0:
+        return None
     
-    df_hist = carregar_historico()
-    if not df_hist.empty:
-        st.dataframe(df_hist, use_container_width=True)
+    # Cálculos para Metal
+    hm_adj = hm * (1 - alpha_m) # Ajuste por defeito (conforme paper/fórmula)
+    QM, d1m, d2m, expr_m = eoq_with_derivative(Sm, hm_adj, D)
+    
+    # Cálculos para Vidro
+    hv_adj = hv * (1 - alpha_v)
+    QV, d1v, d2v, expr_v = eoq_with_derivative(Sv, hv_adj, D)
+
+    # Custo Total Somado
+    CT_val = (Sm*D/QM + hm_adj*QM/2) + (Sv*D/QV + hv_adj*QV/2)
+
+    return {
+        "QM": QM, "QV": QV, "Custo Total": CT_val,
+        "d1m": d1m, "d2m": d2m, "expr_m": expr_m,
+        "d1v": d1v, "d2v": d2v, "expr_v": expr_v,
+        "hm_adj": hm_adj, "hv_adj": hv_adj # Retornamos para usar no gráfico
+    }
+
+# -------------------------------------------------------------
+# 7. INTERFACE E GRÁFICOS DE OTIMIZAÇÃO
+# -------------------------------------------------------------
+st.subheader("2. Otimização de Custos (Cálculo Diferencial)")
+
+c1, c2 = st.columns(2)
+with c1:
+    st.markdown("##### Parâmetros Metal")
+    Sm = st.number_input("Setup ($)", 200.0)
+    hm = st.number_input("Holding ($/un)", 2.0)
+    alpha_m = st.slider("Defeito Metal (%)", 0, 20, 5)/100
+with c2:
+    st.markdown("##### Parâmetros Vidro")
+    Sv = st.number_input("Setup ($)", 180.0)
+    hv = st.number_input("Holding ($/un)", 1.8)
+    alpha_v = st.slider("Defeito Vidro (%)", 0, 20, 4)/100
+
+if st.button("🚀 Calcular Otimização"):
+    res = alkahtani_davizon_optimization(Sm, Sv, hm, hv, alpha_m, alpha_v, D_estimated)
+    
+    if res:
+        # --- EXIBIÇÃO DE RESULTADOS NUMÉRICOS ---
+        st.success("Otimização concluída com sucesso!")
         
-        csv = df_hist.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Baixar Relatório (CSV)",
-            data=csv,
-            file_name='historico_otimizacao.csv',
-            mime='text/csv',
-        )
+        col_res1, col_res2, col_res3 = st.columns(3)
+        col_res1.metric("Lote Ótimo Metal (Q*)", f"{int(res['QM'])}")
+        col_res2.metric("Lote Ótimo Vidro (Q*)", f"{int(res['QV'])}")
+        col_res3.metric("Custo Total Anual", f"R$ {res['Custo Total']:,.2f}")
+        
+        with st.expander("Ver Detalhes Matemáticos (Derivadas)"):
+            st.latex(r"TC(Q) = \frac{S \cdot D}{Q} + \frac{h \cdot Q}{2}")
+            st.write(f"**Metal:** 1ª Derivada no ponto ótimo: {res['d1m']:.4f} (aprox. 0)")
+            st.write(f"**Metal:** 2ª Derivada: {res['d2m']:.6f} (> 0, logo é Mínimo)")
+        
+        # --- VISUALIZAÇÃO 2: CURVA DE CUSTO (Novo!) ---
+        st.subheader("3. Curva de Custo Total (Prova de Convexidade)")
+        st.caption("O gráfico abaixo mostra como o Custo Total varia conforme o tamanho do lote. O ponto vermelho indica o ótimo encontrado pela derivada.")
+
+        # Função auxiliar para gerar pontos do gráfico
+        def get_curve_points(S, h_adj, D, Q_opt):
+            # Cria um intervalo de 50% a 200% do Q ótimo
+            Q_range = np.linspace(Q_opt * 0.5, Q_opt * 2.0, 100)
+            Costs = (S * D / Q_range) + (h_adj * Q_range / 2)
+            return Q_range, Costs
+
+        # Gerar dados
+        Qm_x, Cm_y = get_curve_points(Sm, res['hm_adj'], D_estimated, res['QM'])
+        Qv_x, Cv_y = get_curve_points(Sv, res['hv_adj'], D_estimated, res['QV'])
+
+        # Plotar
+        fig2, (ax_m, ax_v) = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Gráfico Metal
+        sns.lineplot(x=Qm_x, y=Cm_y, ax=ax_m, color='blue')
+        ax_m.scatter([res['QM']], [Cm_y.min()], color='red', s=100, zorder=5, label='Ponto Mínimo (Derivada=0)')
+        ax_m.set_title(f"Curva de Custo: Metal (Q* = {int(res['QM'])})")
+        ax_m.set_xlabel("Tamanho do Lote (Q)")
+        ax_m.set_ylabel("Custo Total ($)")
+        ax_m.legend()
+        ax_m.grid(True, alpha=0.3)
+
+        # Gráfico Vidro
+        sns.lineplot(x=Qv_x, y=Cv_y, ax=ax_v, color='green')
+        ax_v.scatter([res['QV']], [Cv_y.min()], color='red', s=100, zorder=5, label='Ponto Mínimo (Derivada=0)')
+        ax_v.set_title(f"Curva de Custo: Vidro (Q* = {int(res['QV'])})")
+        ax_v.set_xlabel("Tamanho do Lote (Q)")
+        ax_v.legend()
+        ax_v.grid(True, alpha=0.3)
+
+        st.pyplot(fig2)
+        
     else:
-        st.info("Nenhuma simulação realizada ainda ou não foi possível conectar ao banco.")
+        st.error("Erro nos parâmetros (Holding cost deve ser > 0)")
