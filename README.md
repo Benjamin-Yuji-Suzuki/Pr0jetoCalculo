@@ -65,7 +65,7 @@ git clone https://github.com/seu-usuario/seu-projeto.git
 cd seu-projeto
 
 # Instale as bibliotecas necessárias
-pip install streamlit pandas sympy numpy psycopg2-binary
+pip install -r requirements.txt
 ```
 
 ---
